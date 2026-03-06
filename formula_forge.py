@@ -71,9 +71,10 @@ SOLVER_TIME_LIMIT = 30         # seconds
 TEMPERATURE = 0.3              # low temp for structured output reliability
 SLIDES_SCRIPT = Path(__file__).parent / "generate_slides.js"
 
-# Nova Reel (AWS Bedrock) - for turntable video generation
+# Nova (AWS Bedrock) - for turntable video and stylish image generation
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-2")
 NOVA_REEL_MODEL_ID = "amazon.nova-reel-v1:0"
+NOVA_CANVAS_MODEL_ID = "amazon.nova-canvas-v1:0"
 
 # Regulatory hard limits (simplified EU/FDA guardrails)
 REGULATORY_LIMITS: dict[str, float] = {
@@ -1042,9 +1043,10 @@ class FormulaForge:
 
     def _generate_canvas_image(self, user_input: str, formula: Formula, output_path: str) -> Optional[str]:
         """
-        Attempt to generate a product mockup image using DALL·E 3.
+        Attempt to generate a product mockup image.
+        Primary: Amazon Nova Canvas for stylish luxury aesthetic.
+        Fallback: DALL·E 3.
         Returns the image file path on success, None on failure.
-        This is a creative enhancement -- failure is non-fatal.
         """
         try:
             brand_name = getattr(self, '_current_brand_name', user_input)
@@ -1057,9 +1059,40 @@ class FormulaForge:
                 "Professional commercial product shot, centered composition, plain dark background. "
                 "NO humans, NO faces, NO scenery, NO props. Pure product only."
             )
-            console.print(f"  [dim]DALL-E 3 prompt: {image_desc[:120]}...[/dim]")
 
-            # Call DALL-E 3
+            # 1. Try Amazon Nova Canvas
+            if HAS_BOTO3:
+                try:
+                    console.print(f"  [dim]Nova Canvas prompt: {image_desc[:120]}...[/dim]")
+                    bedrock_client = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+                    body = json.dumps({
+                        "taskType": "TEXT_IMAGE",
+                        "textToImageParams": {"text": image_desc[:1000].replace('"', '')},
+                        "imageGenerationConfig": {
+                            "numberOfImages": 1,
+                            "height": 1024,
+                            "width": 1024,
+                            "cfgScale": 8.0,
+                        }
+                    })
+                    resp = bedrock_client.invoke_model(
+                        modelId=NOVA_CANVAS_MODEL_ID,
+                        contentType="application/json",
+                        accept="application/json",
+                        body=body
+                    )
+                    response_body = json.loads(resp.get("body").read().decode("utf-8"))
+                    img_b64 = response_body.get("images")[0]
+                    img_path = output_path.replace(".pptx", "_mockup.png")
+                    with open(img_path, "wb") as f:
+                        f.write(base64.b64decode(img_b64))
+                    console.print(f"  [bold green]Nova Canvas image saved: {img_path}[/bold green]")
+                    return img_path
+                except Exception as nova_exc:
+                    console.print(f"  [yellow]Nova Canvas failed ({nova_exc}), falling back to DALL-E 3...[/yellow]")
+
+            # 2. Fallback to DALL-E 3
+            console.print(f"  [dim]DALL-E 3 prompt: {image_desc[:120]}...[/dim]")
             resp = self.openai_client.client.images.generate(
                 model=DALLE_MODEL_ID,
                 prompt=image_desc[:4000],
@@ -1078,7 +1111,7 @@ class FormulaForge:
             return img_path
 
         except Exception as exc:
-            console.print(f"  [yellow]DALL-E 3 unavailable ({type(exc).__name__}: {exc}), using styled shapes instead[/yellow]")
+            console.print(f"  [yellow]Visual generation unavailable ({type(exc).__name__}: {exc}), using styled shapes instead[/yellow]")
             return None
 
     def generate_360_frames(self, user_input: str, formula: Formula, output_dir: str, num_frames: int = 6) -> list[str]:
@@ -1119,15 +1152,43 @@ class FormulaForge:
             )
 
             try:
-                resp = self.openai_client.client.images.generate(
-                    model=DALLE_MODEL_ID,
-                    prompt=frame_prompt[:4000],
-                    size="1024x1024",
-                    quality="standard",
-                    n=1,
-                    response_format="b64_json",
-                )
-                img_b64 = resp.data[0].b64_json
+                img_b64 = None
+                # 1. Try Amazon Nova Canvas
+                if HAS_BOTO3:
+                    try:
+                        bedrock_client = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+                        body = json.dumps({
+                            "taskType": "TEXT_IMAGE",
+                            "textToImageParams": {"text": frame_prompt[:1000].replace('"', '')},
+                            "imageGenerationConfig": {
+                                "numberOfImages": 1,
+                                "height": 1024,
+                                "width": 1024,
+                                "cfgScale": 8.0,
+                            }
+                        })
+                        resp = bedrock_client.invoke_model(
+                            modelId=NOVA_CANVAS_MODEL_ID,
+                            contentType="application/json",
+                            accept="application/json",
+                            body=body
+                        )
+                        response_body = json.loads(resp.get("body").read().decode("utf-8"))
+                        img_b64 = response_body.get("images")[0]
+                    except Exception as nova_exc:
+                        console.print(f"  [yellow]Nova Canvas failed for frame {i+1}: {nova_exc}[/yellow]")
+
+                # 2. Fallback to DALL-E 3
+                if not img_b64:
+                    resp = self.openai_client.client.images.generate(
+                        model=DALLE_MODEL_ID,
+                        prompt=frame_prompt[:4000],
+                        size="1024x1024",
+                        quality="standard",
+                        n=1,
+                        response_format="b64_json",
+                    )
+                    img_b64 = resp.data[0].b64_json
 
                 frame_path = os.path.join(frames_dir, f"frame_{i:02d}.png")
                 with open(frame_path, "wb") as f:
